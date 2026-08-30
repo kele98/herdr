@@ -64,10 +64,11 @@ pub enum Agent {
     Qwen,
     Maki,
     Muse,
+    MiniMax,
 }
 
 impl Agent {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,
@@ -91,9 +92,10 @@ impl Agent {
         Self::Qwen,
         Self::Maki,
         Self::Muse,
+        Self::MiniMax,
     ];
 
-    pub const SCREEN_MANIFEST_AGENTS: [Self; 21] = [
+    pub const SCREEN_MANIFEST_AGENTS: [Self; 22] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,
@@ -115,6 +117,7 @@ impl Agent {
         Self::Qwen,
         Self::Maki,
         Self::Muse,
+        Self::MiniMax,
     ];
 }
 
@@ -143,6 +146,7 @@ pub fn agent_label(agent: Agent) -> &'static str {
         Agent::Qwen => "qwen",
         Agent::Maki => "maki",
         Agent::Muse => "muse",
+        Agent::MiniMax => "minimax",
     }
 }
 
@@ -177,6 +181,7 @@ pub fn interactive_agent_executable(agent: Agent) -> &'static str {
         Agent::Qwen => "qwen",
         Agent::Maki => "maki",
         Agent::Muse => "muse",
+        Agent::MiniMax => "mcode",
     }
 }
 
@@ -191,7 +196,6 @@ pub(crate) fn parse_canonical_agent_label(label: &str) -> Option<Agent> {
 }
 
 fn lookup_agent(name: &str) -> Option<Agent> {
-    let name = path_basename(name);
     match name {
         "pi" => Some(Agent::Pi),
         "claude" | "claude-code" => Some(Agent::Claude),
@@ -217,21 +221,11 @@ fn lookup_agent(name: &str) -> Option<Agent> {
         "maki" => Some(Agent::Maki),
         "muse" | "muse-code" | "muse-cli" => Some(Agent::Muse),
         _ if is_muse_versioned_binary(name) => Some(Agent::Muse),
+        // Aliases cover the stable MiniMax Code binary ("minimax") and
+        // a few rebrands seen in the wild: "mcode" (Linux/CLI shim).
+        "minimax" | "minimax-code" | "minimax code" | "mcode" => Some(Agent::MiniMax),
         _ => None,
     }
-}
-
-/// Muse's install-dir launcher script resolves the active release and execs
-/// `muse-bin-<version>` (e.g. `muse-bin-0.1.0-R708.1`), so the running
-/// process never carries a bare `muse`/`muse-bin` alias. Require a digit
-/// immediately after the `muse-bin-` prefix so unrelated binaries such as
-/// `muse-binary` or a bare `muse-bin` stay unmatched.
-/// Accepts path-qualified `argv0` values by checking only the basename, since
-/// the launcher may `exec` with an absolute install-dir path.
-fn is_muse_versioned_binary(name: &str) -> bool {
-    path_basename(name)
-        .strip_prefix("muse-bin-")
-        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// Identify which agent is running from the process name.
@@ -606,32 +600,77 @@ fn agent_name_from_path_token(token: &str) -> Option<String> {
 fn agent_name_from_known_package_path(path: &str) -> Option<String> {
     let components: Vec<String> = path
         .split(['/', '\\'])
-        .filter(|component| !component.is_empty())
+        .filter(|component| {
+            !component.is_empty() && *component != "." && *component != ".."
+        })
         .map(normalized_agent_lookup_name)
         .collect();
 
-    for window in components.windows(5) {
-        if window
-            == [
-                "node_modules",
-                "@earendil-works",
-                "pi-coding-agent",
-                "dist",
-                "cli",
-            ]
-        {
-            return Some(agent_label(Agent::Pi).to_string());
+    // Each known agent is identified by its npm package root and a set of
+    // candidate entry basenames. The match tolerates 0 or 1 intermediates
+    // after the root (i.e. the entry appears directly, or after `dist/`/`bin/`).
+    const KNOWN: &[(&[&str], &[&str], &str)] = &[
+        (
+            &["node_modules", "@earendil-works", "pi-coding-agent"],
+            &["cli"],
+            "pi",
+        ),
+        (
+            &["node_modules", "@qwen-code", "qwen-code"],
+            &["index"],
+            "qwen",
+        ),
+        (
+            &["node_modules", "mastracode"],
+            &["cli"],
+            "mastracode",
+        ),
+        (
+            &["node_modules", "@minimax-ai", "code"],
+            // v0.1.2 cli.js at the package root, v0.2.7 .\cli.js at the
+            // package root. Future moves to bin/ or dist/ or renames to
+            // index/main are accepted without a code change to this
+            // matcher.
+            &["cli", "index", "main"],
+            "minimax",
+        ),
+    ];
+
+    for (pkg, entries, label) in KNOWN {
+        let n = pkg.len();
+        if n > components.len() {
+            continue;
         }
-        if window == ["node_modules", "@qwen-code", "qwen-code", "dist", "index"] {
-            return Some(agent_label(Agent::Qwen).to_string());
-        }
-    }
-    for window in components.windows(4) {
-        if window == ["node_modules", "mastracode", "dist", "cli"] {
-            return Some(agent_label(Agent::Mastracode).to_string());
+        for i in 0..=components.len() - n {
+            if &components[i..i + n] != *pkg {
+                continue;
+            }
+            // Direct entry: components[i + n] is a candidate name.
+            for entry in *entries {
+                if components.get(i + n).map(String::as_str) == Some(*entry) {
+                    return agent_label_by_name(label).map(str::to_string);
+                }
+            }
+            // One intermediate: components[i + n + 1] is a candidate name.
+            for entry in *entries {
+                if components.get(i + n + 1).map(String::as_str) == Some(*entry) {
+                    return agent_label_by_name(label).map(str::to_string);
+                }
+            }
         }
     }
     None
+}
+
+// Resolve a label slug from the KNOWN table to the canonical agent label.
+fn agent_label_by_name(label: &str) -> Option<&'static str> {
+    match label {
+        "pi" => Some(agent_label(Agent::Pi)),
+        "qwen" => Some(agent_label(Agent::Qwen)),
+        "mastracode" => Some(agent_label(Agent::Mastracode)),
+        "minimax" => Some(agent_label(Agent::MiniMax)),
+        _ => None,
+    }
 }
 
 fn resolved_agent_name_from_path_token(token: &str) -> Option<String> {
@@ -648,6 +687,20 @@ fn resolved_agent_name_from_path_token(token: &str) -> Option<String> {
 fn agent_name_from_basename(basename: &str) -> Option<String> {
     let agent = parse_agent_label(basename)?;
     Some(agent_label(agent).to_string())
+}
+
+
+/// Muse's install-dir launcher script resolves the active release and execs
+/// `muse-bin-<version>` (e.g. `muse-bin-0.1.0-R708.1`), so the running
+/// process never carries a bare `muse`/`muse-bin` alias. Require a digit
+/// immediately after the `muse-bin-` prefix so unrelated binaries such as
+/// `muse-binary` or a bare `muse-bin` stay unmatched.
+/// Accepts path-qualified `argv0` values by checking only the basename, since
+/// the launcher may `exec` with an absolute install-dir path.
+fn is_muse_versioned_binary(name: &str) -> bool {
+    path_basename(name)
+        .strip_prefix("muse-bin-")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 fn normalized_agent_lookup_name(name: &str) -> String {
@@ -800,6 +853,11 @@ mod tests {
             identify_agent(r"C:\Users\user\muse-bin-0.2.1-R1215.1.exe"),
             Some(Agent::Muse)
         );
+        assert_eq!(identify_agent("minimax"), Some(Agent::MiniMax));
+        assert_eq!(identify_agent("minimax-code"), Some(Agent::MiniMax));
+        assert_eq!(identify_agent("minimax code"), Some(Agent::MiniMax));
+        assert_eq!(identify_agent("mcode"), Some(Agent::MiniMax));
+        assert_eq!(identify_agent("MiniMax"), Some(Agent::MiniMax));
     }
 
     #[test]
@@ -871,6 +929,7 @@ mod tests {
             (Agent::Qwen, "qwen"),
             (Agent::Maki, "maki"),
             (Agent::Muse, "muse"),
+            (Agent::MiniMax, "mcode"),
         ];
         assert_eq!(expected.len(), Agent::ALL.len());
         for (agent, executable) in expected {
@@ -1245,6 +1304,304 @@ mod tests {
         assert_eq!(
             identify_agent_in_job(&job),
             Some((Agent::Claude, "claude".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_node_wrapped_minimax_package_cli() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_v0_2_7_versioned_install_path() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\releases\\0.2.7\\node_modules\\@minimax-ai\\code\\.\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_with_bin_intermediate() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\bin\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_index_entry_name() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\index.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_with_dist_intermediate() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\dist\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_main_entry_name() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\main.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_through_dotdot_in_path() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\repo\\node_modules\\..\\node_modules\\@minimax-ai\\code\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_ignores_minimax_double_intermediate() {
+        // Negative test: a layout with TWO intermediates between the
+        // package root and the entry (e.g. `code/build/release/cli.js`)
+        // should not match. The matcher only tolerates 0-1 intermediates
+        // to keep the false-positive surface small.
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\build\\release\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(identify_agent_in_job(&job), None);
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_unix_versioned_install_path() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node",
+                &[
+                    "node",
+                    "/home/user/.minimax-code/releases/0.2.7/node_modules/@minimax-ai/code/cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_windows_cmd_wrapped_minimax() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                1,
+                "cmd.exe",
+                &[
+                    "cmd.exe",
+                    "/D",
+                    "/S",
+                    "/C",
+                    "C:\\Users\\herdr\\.minimax-code\\mcode.cmd --model m2.7",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_bun_wrapped_minimax_package_cli() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "bun",
+                &[
+                    "bun",
+                    "/home/user/.minimax-code/node_modules/@minimax-ai/code/cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_ignores_minimax_code_fmt_package() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code-fmt\\dist\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(identify_agent_in_job(&job), None);
+    }
+
+    #[test]
+    fn identify_agent_in_job_ignores_minimax_code_server_package() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code-server\\out\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(identify_agent_in_job(&job), None);
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_bare_mcode_basename() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(123, "mcode", &["mcode"])],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "mcode".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_bare_minimax_basename() {
+
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(123, "MiniMax", &["MiniMax"])],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "MiniMax".to_string()))
         );
     }
 

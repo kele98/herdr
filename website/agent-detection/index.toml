@@ -79,3 +79,7 @@ path = "qwen.toml"
 [[agents]]
 id = "copilot"
 path = "github-copilot.toml"
+
+[[agents]]
+id = "minimax"
+path = "minimax.toml"
