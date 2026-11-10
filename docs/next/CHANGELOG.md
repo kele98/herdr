@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- MiniMax Code agent detection (working / permission blocked / plan-mode dialog / idle states) plus v0.1.2 and v0.2.7 install-layout coverage.
+
 ## [0.9.5] - 2026-10-14
 
 This is a hotfix release for v0.9.4. See the v0.9.4 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.4

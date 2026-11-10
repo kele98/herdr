@@ -65,10 +65,11 @@ pub enum Agent {
     Letta,
     Maki,
     Muse,
+    MiniMax,
 }
 
 impl Agent {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,
@@ -93,9 +94,10 @@ impl Agent {
         Self::Letta,
         Self::Maki,
         Self::Muse,
+        Self::MiniMax,
     ];
 
-    pub const SCREEN_MANIFEST_AGENTS: [Self; 22] = [
+    pub const SCREEN_MANIFEST_AGENTS: [Self; 23] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,
@@ -118,6 +120,7 @@ impl Agent {
         Self::Letta,
         Self::Maki,
         Self::Muse,
+        Self::MiniMax,
     ];
 }
 
@@ -147,6 +150,7 @@ pub fn agent_label(agent: Agent) -> &'static str {
         Agent::Letta => "letta",
         Agent::Maki => "maki",
         Agent::Muse => "muse",
+        Agent::MiniMax => "minimax",
     }
 }
 
@@ -182,6 +186,7 @@ pub fn interactive_agent_executable(agent: Agent) -> &'static str {
         Agent::Letta => "letta",
         Agent::Maki => "maki",
         Agent::Muse => "muse",
+        Agent::MiniMax => "mcode",
     }
 }
 
@@ -223,6 +228,7 @@ fn lookup_agent(name: &str) -> Option<Agent> {
         "maki" => Some(Agent::Maki),
         "muse" | "muse-code" | "muse-cli" => Some(Agent::Muse),
         _ if is_muse_versioned_binary(name) => Some(Agent::Muse),
+        "minimax" | "minimax-code" | "minimax code" | "mcode" => Some(Agent::MiniMax),
         _ => None,
     }
 }
@@ -705,7 +711,9 @@ fn agent_name_from_path_token(token: &str) -> Option<String> {
 fn agent_name_from_known_package_path(path: &str) -> Option<String> {
     let raw_components: Vec<&str> = path
         .split(['/', '\\'])
-        .filter(|component| !component.is_empty())
+        .filter(|component| {
+            !component.is_empty() && *component != "." && *component != ".."
+        })
         .collect();
     let ends_with = |suffix: &[&str]| {
         raw_components.len() >= suffix.len()
@@ -747,6 +755,24 @@ fn agent_name_from_known_package_path(path: &str) -> Option<String> {
         "main.mjs",
     ]) {
         return Some(agent_label(Agent::Kimi).to_string());
+    }
+    // MiniMax Code ships its entry under `@minimax-ai/code`. The entry
+    // sits directly under the package root or behind one `bin/`/`dist/`
+    // directory, and the v0.2.7 versioned install adds a `.` component in
+    // front of it (filtered out above).
+    for suffix in [
+        &["node_modules", "@minimax-ai", "code", "cli.js"][..],
+        &["node_modules", "@minimax-ai", "code", "cli"][..],
+        &["node_modules", "@minimax-ai", "code", "index.js"][..],
+        &["node_modules", "@minimax-ai", "code", "index"][..],
+        &["node_modules", "@minimax-ai", "code", "main.js"][..],
+        &["node_modules", "@minimax-ai", "code", "main"][..],
+        &["node_modules", "@minimax-ai", "code", "bin", "cli.js"][..],
+        &["node_modules", "@minimax-ai", "code", "dist", "cli.js"][..],
+    ] {
+        if ends_with(suffix) {
+            return Some(agent_label(Agent::MiniMax).to_string());
+        }
     }
 
     let components: Vec<String> = raw_components
@@ -1037,6 +1063,291 @@ mod tests {
             identify_agent(r"C:\Users\user\muse-bin-0.2.1-R1215.1.exe"),
             Some(Agent::Muse)
         );
+        assert_eq!(identify_agent("minimax"), Some(Agent::MiniMax));
+        assert_eq!(identify_agent("minimax-code"), Some(Agent::MiniMax));
+        assert_eq!(identify_agent("minimax code"), Some(Agent::MiniMax));
+        assert_eq!(identify_agent("mcode"), Some(Agent::MiniMax));
+        assert_eq!(identify_agent("MiniMax"), Some(Agent::MiniMax));
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_node_wrapped_minimax_package_cli() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_v0_2_7_versioned_install_path() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\releases\\0.2.7\\node_modules\\@minimax-ai\\code\\.\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_with_bin_intermediate() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\bin\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_index_entry_name() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\index.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_with_dist_intermediate() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\dist\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_main_entry_name() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\main.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_through_dotdot_in_path() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\repo\\node_modules\\..\\node_modules\\@minimax-ai\\code\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_ignores_minimax_double_intermediate() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code\\build\\release\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(identify_agent_in_job(&job), None);
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_unix_versioned_install_path() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node",
+                &[
+                    "node",
+                    "/home/user/.minimax-code/releases/0.2.7/node_modules/@minimax-ai/code/cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_windows_cmd_wrapped_minimax() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                1,
+                "cmd.exe",
+                &[
+                    "cmd.exe",
+                    "/D",
+                    "/S",
+                    "/C",
+                    "C:\\Users\\herdr\\.minimax-code\\mcode.cmd --model m2.7",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_bun_wrapped_minimax_package_cli() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "bun",
+                &[
+                    "bun",
+                    "/home/user/.minimax-code/node_modules/@minimax-ai/code/cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "minimax".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_ignores_minimax_code_fmt_package() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code-fmt\\dist\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(identify_agent_in_job(&job), None);
+    }
+
+    #[test]
+    fn identify_agent_in_job_ignores_minimax_code_server_package() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\.minimax-code\\node_modules\\@minimax-ai\\code-server\\out\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(identify_agent_in_job(&job), None);
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_bare_mcode_basename() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(123, "mcode", &["mcode"])],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "mcode".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_minimax_via_bare_minimax_basename() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(123, "MiniMax", &["MiniMax"])],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::MiniMax, "MiniMax".to_string()))
+        );
     }
 
     #[test]
@@ -1110,6 +1421,7 @@ mod tests {
             (Agent::Letta, "letta"),
             (Agent::Maki, "maki"),
             (Agent::Muse, "muse"),
+            (Agent::MiniMax, "mcode"),
         ];
         assert_eq!(expected.len(), Agent::ALL.len());
         for (agent, executable) in expected {
